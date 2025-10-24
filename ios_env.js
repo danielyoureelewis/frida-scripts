@@ -17,29 +17,31 @@ rpc.exports.getEnvironmentInfo = function () {
 
     // 1. Get Application Directory Paths (iOS Sandboxed Paths)
     try {
-        const NSFileManager = ObjC.classes.NSFileManager;
         const NSBundle = ObjC.classes.NSBundle;
-        const fileManager = NSFileManager.defaultManager();
-
-        // Get the main application bundle path
         const mainBundle = NSBundle.mainBundle();
+        
+        // Get the main application bundle path
         info.bundlePath = mainBundle.bundlePath().toString();
 
         // Get the home directory (sandbox root)
         const homeDir = ObjC.classes.NSHomeDirectory().toString();
         info.sandboxRoot = homeDir;
 
-        // Construct standard sandboxed paths based on the home directory
-        info.documentsDir = fileManager.URLsForDirectory_inDomains_(
-            0x09, // NSDocumentDirectory
-            0x01  // NSUserDomainMask
-        ).objectAtIndex_(0).path().toString();
-        
-        info.libraryDir = homeDir + '/Library';
-        info.cachesDir = homeDir + '/Library/Caches';
+        // Use the successful homeDir to reliably construct standard sandboxed paths.
+        if (homeDir) {
+            info.libraryDir = homeDir + '/Library';
+            info.cachesDir = homeDir + '/Library/Caches';
+            info.documentsDir = homeDir + '/Documents'; // Direct construction via standard path
+            info.tmpDir = homeDir + '/tmp';
+            
+            // Clean up old error field if successful
+            delete info.directoryError;
+        } else {
+             info.directoryError = "NSHomeDirectory() returned null or empty string.";
+        }
 
     } catch (e) {
-        info.directoryError = "Could not retrieve Objective-C directory paths: " + e.message;
+        info.directoryError = "CRITICAL: Could not retrieve Objective-C directory paths: " + e.message;
     }
 
     // 2. Get Process and System Information
@@ -54,9 +56,31 @@ rpc.exports.getEnvironmentInfo = function () {
 
     // 3. Get Environment Variables
     try {
-        info.environmentVariables = Process.enumerateEnvironmentVariables();
+        // --- UPDATED: Using Objective-C NSProcessInfo as a reliable fallback ---
+        const NSProcessInfo = ObjC.classes.NSProcessInfo;
+        const environment = NSProcessInfo.processInfo().environment();
+
+        // Convert NSDictionary to a clean JavaScript object
+        const envVars = {};
+        const allKeys = environment.allKeys();
+        for (let i = 0; i < allKeys.count(); i++) {
+            const key = allKeys.objectAtIndex_(i).toString();
+            const value = environment.objectForKey_(allKeys.objectAtIndex_(i)).toString();
+            envVars[key] = value;
+        }
+
+        info.environmentVariables = envVars;
+        
+        if (Object.keys(envVars).length === 0) {
+            info.envVarWarning = "Enumeration succeeded but returned zero environment variables. This might be normal for the simulator process.";
+        } else {
+            // Clean up old failure field if successful
+            delete info.envVarFailure;
+        }
+        
     } catch (e) {
-        info.envVarError = "Could not enumerate environment variables: " + e.message;
+        // NSProcessInfo is highly likely to work on Simulator/macOS apps
+        info.envVarFailure = "HARD FAILURE: Could not enumerate environment variables even with NSProcessInfo: " + e.message;
     }
 
 
