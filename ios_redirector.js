@@ -1,9 +1,10 @@
 /**
  * iOS Traffic Redirection and UNIVERSAL SSL Pinning Bypass Frida Script
  *
- * This version uses the most aggressive bypass techniques by hooking low-level
- * SSL functions (SSLSetSessionOption and SSLCopyPeerTrust), and now includes
- * a specific bypass for the popular TrustKit framework.
+ * This version includes three layers of pinning bypass:
+ * 1. Low-Level C/CoreTLS hooks (SSLCopyPeerTrust, SSLSetSessionOption).
+ * 2. TrustKit specific hook.
+ * 3. High-Level Objective-C Delegate hook (NSURLSession challenge handler).
  *
  * Proxy Target: 127.0.0.1:8080
  *
@@ -18,6 +19,9 @@ const PROXY_PORT = 8080;
 // Constant for forced successful trust result
 const K_SEC_TRUST_RESULT_PROCEED = 1; 
 const K_SSL_SESSION_OPTION_DISABLE_CERT_VERIFICATION = 6;
+// NSURLSession challenge disposition values
+const NSURLSessionAuthChallengeUseCredential = 1;
+const NSURLAuthenticationMethodServerTrust = "NSURLAuthenticationMethodServerTrust";
 
 
 // --- Utility Functions ---
@@ -41,24 +45,87 @@ function portToNetworkByteOrder(port) {
     return (port >> 8) | (port << 8) & 0xFFFF;
 }
 
+// --- High-Level Delegate Bypass ---
+// Hooks the NSURLSession delegate method responsible for handling server trust challenges.
+function nsUrlSessionDelegateBypass() {
+    let bypassApplied = false;
+
+    if (ObjC.available) {
+        try {
+            // Find the base class used by many networking stacks for challenge handling
+            const NSURLSessionDelegate = ObjC.classes.NSObject.extend("DelegateHookerNSURLSession");
+
+            // Look up all classes that implement the URLSession:didReceiveChallenge:completionHandler: method
+            // We search for the implementation of this method across all loaded classes
+            const selector = 'URLSession:didReceiveChallenge:completionHandler:';
+            
+            // Search implementation addresses in all loaded classes
+            const imp = ObjC.implement(selector, function(session, challenge, completionHandler) {
+                try {
+                    const protectionSpace = challenge.protectionSpace();
+                    const authMethod = protectionSpace.authenticationMethod().toString();
+
+                    if (authMethod === NSURLAuthenticationMethodServerTrust) {
+                        const serverTrust = protectionSpace.serverTrust();
+                        const credential = ObjC.classes.NSURLCredential.credentialForTrust_(serverTrust);
+                        
+                        // Call the original completion handler to use the trusted credential
+                        completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
+                        
+                        console.log(`[<<<] NSURLSession Delegate Bypass: Handled server trust challenge for ${protectionSpace.host().toString()}`);
+                        return; // Successfully handled the challenge
+                    }
+                } catch (e) {
+                    console.error(`[!!!] Error inside delegate hook logic: ${e.message}`);
+                }
+
+                // If not a server trust challenge or an error occurred, call the original method 
+                // using the original implementation pointer stored on the function object.
+                this.original(session, challenge, completionHandler);
+            });
+            
+            // Now we hook the implementation across all classes that might implement it
+            // This is a powerful, yet invasive hook.
+            Interceptor.attach(imp, {
+                onEnter: function(args) {
+                    this.original = args[4]; // completionHandler block
+                },
+                onLeave: function(retval) {
+                    // No need to change retval here as the completionHandler is called manually
+                }
+            });
+            
+            console.log(`[+] NSURLSession Delegate hook applied to selector: ${selector}`);
+            bypassApplied = true;
+
+        } catch (e) {
+            console.warn(`[-] NSURLSession Delegate hook failed: ${e.message}`);
+        }
+    }
+    return bypassApplied;
+}
+
 
 // --- UNIVERSAL SSL PINNING BYPASS (Most Aggressive) ---
 
 function universalSSLBypass() {
     let bypassActive = false;
     
+    // --- 3. Objective-C Delegate Bypass ---
+    if (nsUrlSessionDelegateBypass()) {
+        bypassActive = true;
+    }
+
     // Attempt to get the Security framework module first
     const securityModule = Process.getModuleByName("Security") || Process.getModuleByName("Security.framework");
 
     // --- TrustKit Pinning Bypass ---
     try {
         if (ObjC.available && ObjC.classes.TSKPinningValidator) {
-            // Target the core validation method used by TrustKit
             const evaluateTrust = ObjC.classes.TSKPinningValidator["- evaluateTrust:forHostname:"];
             
             Interceptor.attach(evaluateTrust.implementation, {
                 onLeave: function(retval) {
-                    // TSKPinningValidationResultSuccess is 0. We replace the original result.
                     if (retval.toInt32() !== 0) {
                         retval.replace(ptr(0));
                         console.log("[<<<] TrustKit Bypass: Forced TSKPinningValidator to return success (0).");
@@ -75,7 +142,6 @@ function universalSSLBypass() {
 
     // --- Hook SSLCopyPeerTrust ---
     let sslCopyPeerTrustPtr = null;
-
     if (securityModule) {
         sslCopyPeerTrustPtr = securityModule.findExportByName("SSLCopyPeerTrust");
     }
@@ -85,7 +151,6 @@ function universalSSLBypass() {
         bypassActive = true;
         Interceptor.attach(sslCopyPeerTrustPtr, {
             onLeave: function(retval) {
-                // SSLCopyPeerTrust returns a status code (0 for success). We force success.
                 retval.replace(0); 
             }
         });
@@ -104,15 +169,13 @@ function universalSSLBypass() {
         bypassActive = true;
         Interceptor.attach(sslSetSessionOptionPtr, {
             onEnter: function(args) {
-                // The function signature is: OSStatus SSLSetSessionOption(SSLContextRef context, int option, Boolean value);
                 const option = args[1].toInt32();
                 
                 if (option === K_SSL_SESSION_OPTION_DISABLE_CERT_VERIFICATION) {
-                    // Force the value argument (args[2]) to TRUE (1)
                     args[2].replace(ptr(1));
                     console.log("[<<<] SSLSetSessionOption: Forced DISABLE_CERT_VERIFICATION to TRUE.");
-                } else if (option === 9) { // Sometimes 9 is used for specific pinning flags
-                    args[2].replace(ptr(0)); // Force to FALSE
+                } else if (option === 9) { 
+                    args[2].replace(ptr(0)); 
                     console.log("[<<<] SSLSetSessionOption: Forced Pinning flag (9) to FALSE.");
                 }
             }
