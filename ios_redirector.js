@@ -39,16 +39,33 @@ function portToNetworkByteOrder(port) {
  * This is the most common way to bypass SSL pinning on iOS.
  */
 function sslPinningBypass() {
-    // --- FRIDA 17+ FIX APPLIED HERE ---
-    // 1. Get the module handle first (Security.framework)
-    const securityModule = Process.getModuleByName("Security.framework");
-    
-    // 2. Safely find the export using the module instance (moduleInstance.findExportByName)
     let secTrustEvaluatePtr = null;
+    
+    // 1. Try to get the module handle using the common short name "Security"
+    let securityModule = Process.getModuleByName("Security");
+
+    if (!securityModule) {
+        // Fallback: Try the full framework name, as done before
+        securityModule = Process.getModuleByName("Security.framework");
+    }
+
     if (securityModule) {
+        // If module is found, get the export pointer
         secTrustEvaluatePtr = securityModule.findExportByName("SecTrustEvaluate");
     }
-    // ----------------------------------
+
+    // 2. Fallback: Search for the export in ALL loaded modules (slow, but defensive)
+    if (!secTrustEvaluatePtr) {
+        console.warn("[-] Security module not directly found. Attempting slow export search...");
+        try {
+            secTrustEvaluatePtr = Module.findExportByName(null, "SecTrustEvaluate");
+        } catch (e) {
+            // Module.findExportByName(null, ...) is a legacy API and might be removed, 
+            // but is sometimes still useful as a fallback.
+            console.warn(`[!] Export search failed: ${e.message}`);
+        }
+    }
+
 
     if (secTrustEvaluatePtr) {
         console.log("[+] Found SecTrustEvaluate. Applying SSL Pinning bypass hook...");
@@ -72,7 +89,15 @@ function sslPinningBypass() {
         });
         return true;
     } else {
-        console.warn("[-] Could not find SecTrustEvaluate. SSL pinning bypass may be incomplete for this app.");
+        console.error("[-] FATAL: Could not find SecTrustEvaluate. SSL pinning bypass will not be active.");
+        
+        // Log all loaded modules to help the user manually verify the correct framework name
+        console.log("\n[!!!] Currently loaded modules (check this list for 'Security' module name):");
+        Process.enumerateModules().forEach(module => {
+            console.log(`    - ${module.name}`);
+        });
+        console.log("--------------------------------------------------\n");
+        
         return false;
     }
 }
