@@ -39,8 +39,16 @@ function portToNetworkByteOrder(port) {
  * This is the most common way to bypass SSL pinning on iOS.
  */
 function sslPinningBypass() {
-    // SecTrustEvaluate is in Security.framework
-    const secTrustEvaluatePtr = Module.findExportByName("Security.framework", "SecTrustEvaluate");
+    // --- FRIDA 17+ FIX APPLIED HERE ---
+    // 1. Get the module handle first (Security.framework)
+    const securityModule = Process.getModuleByName("Security.framework");
+    
+    // 2. Safely find the export using the module instance (moduleInstance.findExportByName)
+    let secTrustEvaluatePtr = null;
+    if (securityModule) {
+        secTrustEvaluatePtr = securityModule.findExportByName("SecTrustEvaluate");
+    }
+    // ----------------------------------
 
     if (secTrustEvaluatePtr) {
         console.log("[+] Found SecTrustEvaluate. Applying SSL Pinning bypass hook...");
