@@ -7,6 +7,8 @@
  * Proxy Target: 127.0.0.1:8080
  *
  * Usage: frida -U -f <BUNDLE_ID> -l traffic_redirector.js --no-pause
+ *
+ * NOTE: Updated for Frida 17+ compatibility by replacing Module.findExportByName.
  */
 
 // --- Configuration ---
@@ -29,28 +31,47 @@ function ipToNetworkByteOrder(ip) {
 // Convert port (host byte order) to network byte order (Big-Endian)
 function portToNetworkByteOrder(port) {
     // Port 8080 (0x1F90) will be represented as 0x901F in Little-Endian memory
-    // but the connect call expects the actual network byte order in memory: 0x1F, 0x90
-    // We write a U16 in Host-Endian and let Frida handle the system's memory layout.
+    // We write a U16 in Host-Endian and let Frida handle the system's memory layout for storage.
     return (port >> 8) | (port << 8) & 0xFFFF;
 }
 
 
 // --- Main Hooking Logic ---
 try {
-    // 1. Find the address of the connect function in libSystem.B.dylib
-    const connectPtr = Module.findExportByName("libSystem.B.dylib", "connect");
+    // --- FRIDA 17+ COMPATIBILITY FIX ---
+    // 1. Get the module handle first (libSystem.B.dylib is sometimes referred to as libSystem.B.dylib or libSystem.B.dylib)
+    const libSystem = Process.getModuleByName("libSystem.B.dylib");
 
-    if (connectPtr) {
-        console.log(`[+] Found connect at ${connectPtr}`);
+    // 2. Find the address of the connect function using the module handle
+    let connectPtr = null;
+    if (libSystem) {
+        // Use the module instance to find the export
+        connectPtr = libSystem.findExportByName("connect");
+    }
+    // ------------------------------------
 
-        const newIP_NBO = ipToNetworkByteOrder(PROXY_IP);
-        const newPort_NBO = portToNetworkByteOrder(PROXY_PORT);
+    if (!connectPtr) { // Check for null/undefined explicitly
+        console.error("[-] Could not find 'connect' export in libSystem.B.dylib. Ensure the target is running and the export exists.");
+        return;
+    }
+    
+    console.log(`[+] Found connect at ${connectPtr}`);
 
-        Interceptor.attach(connectPtr, {
-            onEnter: function (args) {
+    const newIP_NBO = ipToNetworkByteOrder(PROXY_IP);
+    const newPort_NBO = portToNetworkByteOrder(PROXY_PORT);
+
+    Interceptor.attach(connectPtr, {
+        onEnter: function (args) {
+            try {
                 // The connect function signature is: int connect(int socket, const struct sockaddr *address, socklen_t address_len);
                 // We are interested in the second argument: const struct sockaddr *address (args[1])
                 const addr = args[1];
+
+                // CRITICAL FIX: Check if the address pointer is NULL before dereferencing it.
+                if (addr.isNull()) {
+                    console.warn("[-] connect() called with a NULL address pointer. Skipping hook for this call.");
+                    return;
+                }
 
                 // 2. Read the address family (sa_family) from the sockaddr structure.
                 // It's located at offset 1 (1 byte after sa_len, which is usually 1 byte).
@@ -66,6 +87,7 @@ try {
                     const originalIP = addr.add(4).readU32();
 
                     // Convert Network Byte Order (NBO) values back to human-readable strings for logging
+                    // We only swap bytes for the Port for logging, the IP is read into an integer for bitwise operations
                     const originalPortHost = (originalPort >> 8) | (originalPort << 8) & 0xFFFF;
                     const originalIPStr = [
                         (originalIP >> 24) & 0xFF,
@@ -86,18 +108,27 @@ try {
 
                     console.log(`[<<<] Redirected to ${PROXY_IP}:${PROXY_PORT}`);
                 }
-            },
-            onLeave: function (retval) {
-                // Connection result can be inspected here if needed
-                // For now, we only care about modifying the destination on entry
+            } catch (e) {
+                // Enhanced error logging: log the error and the native stack trace
+                console.error(`[!!!] Error inside onEnter hook: ${e.message}`);
+                console.error(`[!!!] Backtrace (Native):`);
+                
+                // Log the native stack trace for context on the call
+                console.error(Thread.backtrace(this.context, Backtracer.ACCURATE)
+                    .map(DebugSymbol.fromAddress).join('\n'));
+                
+                // You can also throw to stop the process if the error is critical:
+                // throw new Error("Critical error in traffic redirection.");
             }
-        });
+        },
+        onLeave: function (retval) {
+            // No changes needed here, as the original issue was in onEnter
+        }
+    });
 
-        console.log(`[+] Frida script loaded successfully. All IPv4 traffic is being redirected to ${PROXY_IP}:${PROXY_PORT}.`);
+    console.log(`[+] Frida script loaded successfully. All IPv4 traffic is being redirected to ${PROXY_IP}:${PROXY_PORT}.`);
 
-    } else {
-        console.error("[-] Could not find 'connect' export in libSystem.B.dylib.");
-    }
 } catch (e) {
-    console.error(`[-] An error occurred: ${e.message}`);
+    // Log errors during script initialization
+    console.error(`[-] An error occurred during script initialization: ${e.message}`);
 }
