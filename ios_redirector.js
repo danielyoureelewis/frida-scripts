@@ -2,8 +2,8 @@
  * iOS Traffic Redirection and UNIVERSAL SSL Pinning Bypass Frida Script
  *
  * This version uses the most aggressive bypass techniques by hooking low-level
- * SSL functions (SSLSetSessionOption and SSLCopyPeerTrust) to disable pinning
- * checks at the core networking library level, in addition to the connect hook.
+ * SSL functions (SSLSetSessionOption and SSLCopyPeerTrust), and now includes
+ * a specific bypass for the popular TrustKit framework.
  *
  * Proxy Target: 127.0.0.1:8080
  *
@@ -47,11 +47,34 @@ function portToNetworkByteOrder(port) {
 function universalSSLBypass() {
     let bypassActive = false;
     
-    // --- Hook SSLCopyPeerTrust ---
-    // SSLCopyPeerTrust copies the trust object. We hook it to replace the trust
-    // object with a successful result before the app can inspect it.
-    let sslCopyPeerTrustPtr = null;
+    // Attempt to get the Security framework module first
     const securityModule = Process.getModuleByName("Security") || Process.getModuleByName("Security.framework");
+
+    // --- TrustKit Pinning Bypass ---
+    try {
+        if (ObjC.available && ObjC.classes.TSKPinningValidator) {
+            // Target the core validation method used by TrustKit
+            const evaluateTrust = ObjC.classes.TSKPinningValidator["- evaluateTrust:forHostname:"];
+            
+            Interceptor.attach(evaluateTrust.implementation, {
+                onLeave: function(retval) {
+                    // TSKPinningValidationResultSuccess is 0. We replace the original result.
+                    if (retval.toInt32() !== 0) {
+                        retval.replace(ptr(0));
+                        console.log("[<<<] TrustKit Bypass: Forced TSKPinningValidator to return success (0).");
+                    }
+                }
+            });
+            console.log("[+] TrustKit PinningValidator hook applied.");
+            bypassActive = true;
+        }
+    } catch (e) {
+        console.warn(`[-] TrustKit hook failed (may not be present): ${e.message}`);
+    }
+
+
+    // --- Hook SSLCopyPeerTrust ---
+    let sslCopyPeerTrustPtr = null;
 
     if (securityModule) {
         sslCopyPeerTrustPtr = securityModule.findExportByName("SSLCopyPeerTrust");
@@ -71,7 +94,6 @@ function universalSSLBypass() {
     }
 
     // --- Hook SSLSetSessionOption ---
-    // SSLSetSessionOption is used to set various options, including disabling cert verification.
     let sslSetSessionOptionPtr = null;
     if (securityModule) {
         sslSetSessionOptionPtr = securityModule.findExportByName("SSLSetSessionOption");
