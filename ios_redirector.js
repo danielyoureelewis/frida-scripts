@@ -14,7 +14,8 @@
 // --- Configuration ---
 const PROXY_IP = "127.0.0.1";
 const PROXY_PORT = 8080;
-const K_SEC_TRUST_RESULT_PROCEED = 1; // Constant for forced success
+// Constant for forced successful trust result
+const K_SEC_TRUST_RESULT_PROCEED = 1; 
 
 // Convert IP string (e.g., "127.0.0.1") to its network byte order 32-bit integer (e.g., 0x7F000001)
 function ipToNetworkByteOrder(ip) {
@@ -31,53 +32,45 @@ function ipToNetworkByteOrder(ip) {
 
 // Convert port (host byte order) to network byte order (Big-Endian)
 function portToNetworkByteOrder(port) {
+    // Port 8080 (0x1F90) will be represented as 0x901F in Little-Endian memory
+    // but the connect call expects the actual network byte order in memory: 0x1F, 0x90
+    // We write a U16 in Host-Endian and let Frida handle the system's memory layout.
     return (port >> 8) | (port << 8) & 0xFFFF;
 }
 
 /**
+ * [SSL PINNING BYPASS]
  * Hooks SecTrustEvaluate and forces it to return success (kSecTrustResultProceed).
- * This is the most common way to bypass SSL pinning on iOS.
+ * This uses the defensive search logic to account for different module loading states.
  */
 function sslPinningBypass() {
     let secTrustEvaluatePtr = null;
     
-    // 1. Try to get the module handle using the common short name "Security"
-    let securityModule = Process.getModuleByName("Security");
-
-    if (!securityModule) {
-        // Fallback: Try the full framework name, as done before
-        securityModule = Process.getModuleByName("Security.framework");
-    }
+    // Attempt to locate SecTrustEvaluate using common names and a fallback search
+    const securityModule = Process.getModuleByName("Security") || Process.getModuleByName("Security.framework");
 
     if (securityModule) {
-        // If module is found, get the export pointer
         secTrustEvaluatePtr = securityModule.findExportByName("SecTrustEvaluate");
     }
 
-    // 2. Fallback: Search for the export in ALL loaded modules (slow, but defensive)
     if (!secTrustEvaluatePtr) {
-        console.warn("[-] Security module not directly found. Attempting slow export search...");
+        // Defensive fallback: Search for the export in ALL loaded modules
         try {
             secTrustEvaluatePtr = Module.findExportByName(null, "SecTrustEvaluate");
         } catch (e) {
-            // Module.findExportByName(null, ...) is a legacy API and might be removed, 
-            // but is sometimes still useful as a fallback.
-            console.warn(`[!] Export search failed: ${e.message}`);
+            // Log warning if fallback fails
         }
     }
-
 
     if (secTrustEvaluatePtr) {
         console.log("[+] Found SecTrustEvaluate. Applying SSL Pinning bypass hook...");
         
         Interceptor.attach(secTrustEvaluatePtr, {
             onLeave: function(retval) {
-                // The function signature is OSStatus SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result);
-                // retval is the OSStatus, which should be 0 (errSecSuccess)
+                // SecTrustEvaluate returns OSStatus (0 for success). We force success.
                 retval.replace(0); 
                 
-                // args[1] is the pointer to the result (SecTrustResultType *result)
-                // In Frida's hook context, the second argument (SecTrustResultType *) is usually x1 on arm64
+                // The result pointer (SecTrustResultType *) is typically the second argument (x1 on arm64).
                 const resultPtr = this.context.x1; 
                 
                 if (resultPtr && !resultPtr.isNull()) {
@@ -89,15 +82,7 @@ function sslPinningBypass() {
         });
         return true;
     } else {
-        console.error("[-] FATAL: Could not find SecTrustEvaluate. SSL pinning bypass will not be active.");
-        
-        // Log all loaded modules to help the user manually verify the correct framework name
-        console.log("\n[!!!] Currently loaded modules (check this list for 'Security' module name):");
-        Process.enumerateModules().forEach(module => {
-            console.log(`    - ${module.name}`);
-        });
-        console.log("--------------------------------------------------\n");
-        
+        console.warn("[-] Could not find SecTrustEvaluate. SSL pinning bypass will not be active.");
         return false;
     }
 }
@@ -105,20 +90,18 @@ function sslPinningBypass() {
 
 // --- Main Hooking Logic ---
 try {
-    // --- FRIDA 17+ COMPATIBILITY FIX: Locate connect ---
+    // 1. **FIRST STEP: Execute SSL Pinning Bypass**
+    const bypassApplied = sslPinningBypass();
+    
+    // 2. Proceed with Traffic Redirection
     const libSystem = Process.getModuleByName("libSystem.B.dylib");
 
     let connectPtr = null;
     if (libSystem) {
         connectPtr = libSystem.findExportByName("connect");
     }
-    // ------------------------------------
-
-    // EXECUTE THE SSL BYPASS FUNCTION (always attempt to apply the bypass)
-    const bypassApplied = sslPinningBypass();
 
     if (connectPtr) {
-        // If 'connect' pointer is found, proceed with traffic redirection hook
         console.log(`[+] Found connect at ${connectPtr}`);
 
         const newIP_NBO = ipToNetworkByteOrder(PROXY_IP);
@@ -128,21 +111,27 @@ try {
             onEnter: function (args) {
                 try {
                     // The connect function signature is: int connect(int socket, const struct sockaddr *address, socklen_t address_len);
+                    // We are interested in the second argument: const struct sockaddr *address (args[1])
                     const addr = args[1];
 
                     if (addr.isNull()) {
-                        return;
+                        return; // Safely exit if pointer is null
                     }
-
+                    
                     // 2. Read the address family (sa_family) from the sockaddr structure.
+                    // It's located at offset 1 (1 byte after sa_len, which is usually 1 byte).
                     const sa_family = addr.add(1).readU8(); // AF_INET is 2, AF_INET6 is 30
 
                     // Only intercept IPv4 connections (AF_INET = 2)
                     if (sa_family === 2) {
+                        // Structure is sockaddr_in (16 bytes)
+                        // Offset 2: Port (2 bytes)
+                        // Offset 4: IP Address (4 bytes)
+
                         const originalPort = addr.add(2).readU16();
                         const originalIP = addr.add(4).readU32();
 
-                        // Convert Network Byte Order (NBO) values back to human-readable strings for logging
+                        // Conversion for logging only
                         const originalPortHost = (originalPort >> 8) | (originalPort << 8) & 0xFFFF;
                         const originalIPStr = [
                             (originalIP >> 24) & 0xFF,
@@ -154,13 +143,16 @@ try {
                         console.log(`[***] Intercepting connection to ${originalIPStr}:${originalPortHost}...`);
 
                         // 3. Overwrite the destination address to the proxy (127.0.0.1:8080)
+                        
+                        // Write new port (Network Byte Order)
                         addr.add(2).writeU16(newPort_NBO);
+
+                        // Write new IP address (Network Byte Order)
                         addr.add(4).writeU32(newIP_NBO);
 
                         console.log(`[<<<] Redirected to ${PROXY_IP}:${PROXY_PORT}`);
                     }
                 } catch (e) {
-                    // Enhanced error logging: log the error and the native stack trace
                     console.error(`[!!!] Error inside connect hook onEnter: ${e.message}`);
                     console.error(`[!!!] Backtrace (Native):`);
                     
@@ -176,12 +168,9 @@ try {
         console.log(`[+] Frida script loaded successfully. Traffic redirection is active. SSL bypass status: ${bypassApplied ? 'Active' : 'Warning'}.`);
 
     } else {
-        // If 'connect' pointer is NOT found, log the failure but note the SSL bypass status
         console.error("[-] Traffic redirection is DISABLED because 'connect' function could not be located in libSystem.B.dylib.");
         console.log(`[!] Script loaded. SSL bypass status: ${bypassApplied ? 'Active' : 'Warning'}.`);
     }
-
 } catch (e) {
-    // Log errors during script initialization
     console.error(`[-] A critical error occurred during script initialization: ${e.message}`);
 }
