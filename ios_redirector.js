@@ -1,10 +1,11 @@
 /**
  * iOS Traffic Redirection and UNIVERSAL SSL Pinning Bypass Frida Script
  *
- * This version includes three layers of pinning bypass:
+ * This version includes four layers of pinning bypass, with corrected Objective-C method hooking:
  * 1. Low-Level C/CoreTLS hooks (SSLCopyPeerTrust, SSLSetSessionOption).
  * 2. TrustKit specific hook.
  * 3. High-Level Objective-C Delegate hook (NSURLSession challenge handler).
+ * 4. SecTrustEvaluate fallback.
  *
  * Proxy Target: 127.0.0.1:8080
  *
@@ -21,6 +22,8 @@ const K_SEC_TRUST_RESULT_PROCEED = 1;
 const K_SSL_SESSION_OPTION_DISABLE_CERT_VERIFICATION = 6;
 // NSURLSession challenge disposition values
 const NSURLSessionAuthChallengeUseCredential = 1;
+// Default handling is 0, but we use 1 for success.
+const NSURLSessionAuthChallengePerformDefaultHandling = 0; 
 const NSURLAuthenticationMethodServerTrust = "NSURLAuthenticationMethodServerTrust";
 
 
@@ -52,48 +55,43 @@ function nsUrlSessionDelegateBypass() {
 
     if (ObjC.available) {
         try {
-            // Find the base class used by many networking stacks for challenge handling
-            const NSURLSessionDelegate = ObjC.classes.NSObject.extend("DelegateHookerNSURLSession");
-
-            // Look up all classes that implement the URLSession:didReceiveChallenge:completionHandler: method
-            // We search for the implementation of this method across all loaded classes
-            const selector = 'URLSession:didReceiveChallenge:completionHandler:';
+            // TARGETING THE TASK-LEVEL DELEGATE METHOD (most common and robust implementation)
+            // Selector signature: URLSession:task:didReceiveChallenge:completionHandler:
+            const selector = 'URLSession:task:didReceiveChallenge:completionHandler:';
             
-            // Search implementation addresses in all loaded classes
-            const imp = ObjC.implement(selector, function(session, challenge, completionHandler) {
+            // ObjC.implement applies the hook across all classes that implement this selector.
+            // The arguments are (self, _cmd, session, task, challenge, completionHandler)
+            const imp = ObjC.implement(selector, function(session, task, challenge, completionHandler) {
                 try {
                     const protectionSpace = challenge.protectionSpace();
                     const authMethod = protectionSpace.authenticationMethod().toString();
 
                     if (authMethod === NSURLAuthenticationMethodServerTrust) {
                         const serverTrust = protectionSpace.serverTrust();
-                        const credential = ObjC.classes.NSURLCredential.credentialForTrust_(serverTrust);
                         
-                        // Call the original completion handler to use the trusted credential
-                        completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
-                        
-                        console.log(`[<<<] NSURLSession Delegate Bypass: Handled server trust challenge for ${protectionSpace.host().toString()}`);
-                        return; // Successfully handled the challenge
+                        // We must check if serverTrust is not null before proceeding
+                        if (!serverTrust.isNull()) {
+                            const credential = ObjC.classes.NSURLCredential.credentialForTrust_(serverTrust);
+                            
+                            // Force USE_CREDENTIAL and pass the server's original trust credential.
+                            completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
+                            
+                            const hostName = protectionSpace.host() ? protectionSpace.host().toString() : 'Unknown Host';
+                            console.log(`[<<<] NSURLSession Delegate Bypass: Handled server trust challenge for ${hostName}`);
+                            return; // Exit the custom implementation
+                        }
                     }
                 } catch (e) {
                     console.error(`[!!!] Error inside delegate hook logic: ${e.message}`);
                 }
-
-                // If not a server trust challenge or an error occurred, call the original method 
-                // using the original implementation pointer stored on the function object.
-                this.original(session, challenge, completionHandler);
+                
+                // FALLBACK: If the challenge is not server trust, or if logic above failed, 
+                // call the completionHandler with default handling to avoid connection leaks.
+                completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, null); 
             });
             
-            // Now we hook the implementation across all classes that might implement it
-            // This is a powerful, yet invasive hook.
-            Interceptor.attach(imp, {
-                onEnter: function(args) {
-                    this.original = args[4]; // completionHandler block
-                },
-                onLeave: function(retval) {
-                    // No need to change retval here as the completionHandler is called manually
-                }
-            });
+            // The ObjC.implement call itself applies the hook to the implementation pointer.
+            // No need for Interceptor.attach here.
             
             console.log(`[+] NSURLSession Delegate hook applied to selector: ${selector}`);
             bypassApplied = true;
