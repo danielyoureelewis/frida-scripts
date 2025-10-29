@@ -1,151 +1,279 @@
-// proxy.js
-// Frida script (Frida 17 safe) that rewrites IPv4 connect() destinations to 127.0.0.1:8080
-// Usage: frida -U -f <package.or.binary> -l proxy.js --no-pause
-
-'use strict';
-
-// Target redirect
-const TARGET_IP = '127.0.0.1';
+// proxy_ios.js
+// iOS-focused Frida proxy: rewrites IPv4 connects and higher-level CF/NSURLSession APIs
+// Redirect target:
+const TARGET_IP = "127.0.0.1";
 const TARGET_PORT = 8080;
 
-// ---------- Helpers ----------
-function ipToBytes(ip) {
-    return ip.split('.').map(p => parseInt(p, 10) & 0xff);
+function htons(x) {
+    return ((x & 0xff) << 8) | ((x >> 8) & 0xff);
 }
-function portToBytes(port) {
-    // network order (big-endian)
-    return [(port >> 8) & 0xff, port & 0xff];
+function htonl(x) {
+    return ((x & 0xff) << 24) |
+           ((x & 0xff00) << 8) |
+           ((x >> 8) & 0xff00) |
+           ((x >> 24) & 0xff);
 }
-
-// Read sockaddr_in (IPv4) for logging
-function readSockaddrIn(ptrSockaddr) {
+function ipToIntBE(ip) {
+    const p = ip.split('.').map(n => parseInt(n,10) & 0xff);
+    return ((p[0] << 24) >>> 0) | ((p[1] << 16) >>> 0) | ((p[2] << 8) >>> 0) | (p[3] >>> 0);
+}
+function readSockaddrIn(ptr) {
     try {
-        const family = Memory.readU16(ptrSockaddr);
-        // read port bytes individually (network order)
-        const portHigh = Memory.readU8(ptrSockaddr.add(2));
-        const portLow  = Memory.readU8(ptrSockaddr.add(3));
-        const portHost = (portHigh << 8) | portLow;
-        const b0 = Memory.readU8(ptrSockaddr.add(4));
-        const b1 = Memory.readU8(ptrSockaddr.add(5));
-        const b2 = Memory.readU8(ptrSockaddr.add(6));
-        const b3 = Memory.readU8(ptrSockaddr.add(7));
-        const ipStr = [b0,b1,b2,b3].join('.');
-        return { family: family, ipStr: ipStr, portHost: portHost };
-    } catch (e) {
-        return null;
-    }
+        const family = Memory.readU16(ptr);
+        const portNet = Memory.readU16(ptr.add(2));
+        const ipNet = Memory.readU32(ptr.add(4));
+        const portHost = ((portNet & 0xff) << 8) | ((portNet >> 8) & 0xff);
+        const b0 = (ipNet >>> 24) & 0xff;
+        const b1 = (ipNet >>> 16) & 0xff;
+        const b2 = (ipNet >>> 8) & 0xff;
+        const b3 = (ipNet) & 0xff;
+        return { family, ipStr: [b0,b1,b2,b3].join('.'), portHost };
+    } catch (e) { return null; }
 }
 
-// Write sockaddr_in (overwrite port and IPv4 address) using explicit bytes to avoid endianness pitfalls
-function writeSockaddrIn(ptrSockaddr, ipStr, port) {
-    const portBytes = portToBytes(port);
-    const ipBytes = ipToBytes(ipStr);
-    // Write port (2 bytes) followed by ip (4 bytes) starting at offset 2
-    const combined = [portBytes[0], portBytes[1], ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3]];
-    Memory.writeByteArray(ptrSockaddr.add(2), combined);
-}
+function attachConnectExport(ptr, label) {
+    try {
+        Interceptor.attach(ptr, {
+            onEnter: function (args) {
+                // int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+                this.sockfd = args[0].toInt32();
+                this.addr = args[1];
+                try {
+                    if (this.addr.isNull()) return;
+                } catch (e) { return; }
 
-// ---------- Robust connect symbol finder (Frida 17 safe) ----------
-function findConnectSymbol() {
-    const commonLibs = {
-        'android': ['libc.so'],
-        'linux':   ['libc.so.6','libc.so'],
-        'darwin':  ['libSystem.B.dylib','libSystem.dylib','libSystem'],
-        'ios':     ['libSystem.B.dylib','libSystem.dylib','libSystem'],
-        'windows': ['Ws2_32.dll','ws2_32.dll','msvcrt.dll']
-    }[Process.platform] || ['libc.so'];
+                let family = 0;
+                try { family = Memory.readU16(this.addr); } catch (e) { family = 0; }
 
-    for (let name of commonLibs) {
-        try {
-            const addr = Module.findExportByName(name, 'connect');
-            if (addr) {
-                console.log('[finder] connect found in', name, '->', addr);
-                return addr;
+                if (family === 2) { // AF_INET
+                    const orig = readSockaddrIn(this.addr) || {};
+                    console.log(`[${label}] fd=${this.sockfd} original -> ${orig.ipStr||'?'}:${orig.portHost||'?'}`);
+                    const portNet = htons(TARGET_PORT);
+                    const ipNet = ipToIntBE(TARGET_IP);
+                    Memory.writeU16(this.addr.add(2), portNet);            // sin_port
+                    Memory.writeU32(this.addr.add(4), htonl(ipNet));       // sin_addr (network order)
+                    const after = readSockaddrIn(this.addr) || {};
+                    console.log(`[${label}] fd=${this.sockfd} redirected -> ${after.ipStr||'?'}:${after.portHost||'?'}`);
+                }
             }
-        } catch (e) {
-            // ignore
-        }
+        });
+        console.log(`Attached to ${label} @ ${ptr}`);
+        return true;
+    } catch (e) {
+        console.warn('attachConnectExport error for ' + label + ': ' + e);
+        return false;
+    }
+}
+
+function tryNativeConnectHooks() {
+    const candidates = ['connect', 'connect$NOCANCEL', 'connectat', 'sys_connect'];
+    let attached = false;
+
+    candidates.forEach(name => {
+        try {
+            const p = Module.findExportByName(null, name);
+            if (p) {
+                if (attachConnectExport(p, name)) attached = true;
+            }
+        } catch (e) {}
+    });
+
+    // enumerate modules and look for exports that contain "connect"
+    if (!attached) {
+        Process.enumerateModulesSync().forEach(m => {
+            try {
+                Module.enumerateExportsSync(m.name).forEach(exp => {
+                    if (exp.name === 'connect' || exp.name.indexOf('connect') !== -1) {
+                        if (attachConnectExport(exp.address, `${m.name}!${exp.name}`)) attached = true;
+                    }
+                });
+            } catch (e) {}
+        });
     }
 
-    // Full-scan fallback: enumerate modules and their exports (slower, but robust)
-    try {
-        const mods = Module.enumerateModulesSync();
-        for (let m of mods) {
-            try {
-                const exps = Module.enumerateExportsSync(m.name);
-                for (let e of exps) {
-                    if (e.name === 'connect') {
-                        console.log('[finder] connect found in', m.name, '->', e.address);
-                        return e.address;
+    if (!attached) {
+        console.log('No native connect exports found/attached.');
+    }
+    return attached;
+}
+
+// CFStream hook: CFStreamCreatePairWithSocketToHost(CFAllocatorRef, CFStringRef host, UInt32 port, CFReadStreamRef *readStream, CFWriteStreamRef *writeStream)
+function tryCFStreamHook() {
+    const names = ['CFStreamCreatePairWithSocketToHost', '_CFStreamCreatePairWithSocketToHost'];
+    for (let name of names) {
+        try {
+            const addr = Module.findExportByName(null, name);
+            if (!addr) continue;
+            Interceptor.attach(addr, {
+                onEnter: function (args) {
+                    try {
+                        // args[1] is CFStringRef host, args[2] is port (UInt32)
+                        const hostPtr = args[1];
+                        const port = args[2].toInt32();
+                        // Attempt to read host string
+                        let origHost = '<unknown>';
+                        try {
+                            if (!hostPtr.isNull()) origHost = ObjC.Object(hostPtr).toString();
+                        } catch (e) {}
+                        console.log(`[CFStream] original host=${origHost} port=${port}`);
+                        // Replace host and port
+                        try {
+                            const newHost = ObjC.classes.CFStringCreateWithCString(null, TARGET_IP, 0); // kCFStringEncodingUTF8 = 0
+                            args[1] = newHost;
+                            args[2] = ptr(TARGET_PORT);
+                            console.log(`[CFStream] redirected to ${TARGET_IP}:${TARGET_PORT}`);
+                        } catch (e) {
+                            // fallback: attempt to write pointer directly (not ideal)
+                            console.warn('[CFStream] failed to replace CFString: ' + e);
+                        }
+                    } catch (e) {
+                        // ignore
                     }
                 }
-            } catch (e) {
-                // ignore modules we can't inspect
-            }
-        }
-    } catch (e) {
-        console.warn('[finder] full-scan failed:', e);
+            });
+            console.log('Attached CFStream hook to ' + name + ' @ ' + addr);
+            return true;
+        } catch (e) {}
     }
-
-    console.error('[finder] connect() symbol not found');
-    return null;
+    console.log('CFStreamCreatePairWithSocketToHost not found or hook failed.');
+    return false;
 }
 
-// ---------- Hook connect() ----------
-const connectPtr = findConnectSymbol();
-if (!connectPtr) {
-    // If you prefer not to abort, comment the next line and proceed with alternative hooks (e.g., sendto, socket, Java Socket#connect)
-    throw new Error('connect() symbol not found — aborting hook');
-}
+// Objective-C: rewrite NSURLSession requests
+function tryObjCHooks() {
+    if (!ObjC.available) {
+        console.log('ObjC runtime not available; skipping NSURLSession hooks.');
+        return false;
+    }
+    try {
+        const NSURL = ObjC.classes.NSURL;
+        const NSURLRequest = ObjC.classes.NSURLRequest;
+        const NSMutableURLRequest = ObjC.classes.NSMutableURLRequest;
+        const NSURLSession = ObjC.classes.NSURLSession;
 
-console.log('Hooking connect at', connectPtr);
-
-Interceptor.attach(connectPtr, {
-    onEnter: function (args) {
-        // signature: int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
-        this.sockfd = args[0].toInt32();
-        this.addr = args[1];
-        this.addrlen = args[2].toInt32();
-
-        if (this.addr.isNull()) {
-            return;
-        }
-
-        // read family (uint16_t at offset 0)
-        let family;
-        try {
-            family = Memory.readU16(this.addr);
-        } catch (e) {
-            console.warn('[connect-hook] unreadable sockaddr family:', e);
-            return;
-        }
-
-        // AF_INET typically equals 2 on most platforms
-        if (family === 2) {
-            const orig = readSockaddrIn(this.addr);
-            if (orig) {
-                console.log('[connect] fd=' + this.sockfd + ' original -> ' + orig.ipStr + ':' + orig.portHost);
-            } else {
-                console.log('[connect] fd=' + this.sockfd + ' original -> <unreadable sockaddr_in>');
-            }
-
+        function makeLocalURLWithOriginal(origURLString) {
             try {
-                writeSockaddrIn(this.addr, TARGET_IP, TARGET_PORT);
-                const after = readSockaddrIn(this.addr);
-                if (after) {
-                    console.log('[connect] fd=' + this.sockfd + ' redirected -> ' + after.ipStr + ':' + after.portHost);
-                } else {
-                    console.log('[connect] fd=' + this.sockfd + ' redirected -> <unreadable sockaddr_in>');
-                }
+                // preserve path+query; replace host+port
+                const urlObj = NSURL.URLWithString_(origURLString);
+                if (urlObj === null) return null;
+                const path = urlObj.path ? urlObj.path().toString() : '';
+                const query = urlObj.query ? ('?' + urlObj.query().toString()) : '';
+                const scheme = urlObj.scheme ? urlObj.scheme().toString() : 'http';
+                const newUrlStr = scheme + "://" + TARGET_IP + ":" + TARGET_PORT + (path || '/') + (query || '');
+                return NSURL.URLWithString_(newUrlStr);
             } catch (e) {
-                console.warn('[connect-hook] error writing redirected sockaddr:', e);
+                return null;
             }
-        } else {
-            // Not AF_INET; leave alone. (If you need AF_INET6 add handling for sockaddr_in6.)
         }
-    },
-    onLeave: function (retval) {
-        // optional: log result
-        // console.log('connect returned', retval.toInt32());
+
+        // helper to copy headers and method into mutable request
+        function buildProxyRequest(origReq) {
+            try {
+                // origReq may be NSURLRequest or NSMutableURLRequest
+                const origURL = origReq.URL ? origReq.URL().toString() : null;
+                const newNSURL = makeLocalURLWithOriginal(origURL);
+                if (!newNSURL) return origReq;
+
+                const m = NSMutableURLRequest.alloc().initWithURL_(newNSURL);
+                // copy method
+                try {
+                    const method = origReq.HTTPMethod ? origReq.HTTPMethod() : null;
+                    if (method) m.setHTTPMethod_(method);
+                } catch (e) {}
+                // copy headers
+                try {
+                    const headers = origReq.allHTTPHeaderFields ? origReq.allHTTPHeaderFields() : null;
+                    if (headers) {
+                        const keys = headers.allKeys();
+                        for (let i = 0; i < keys.count(); i++) {
+                            const k = keys.objectAtIndex_(i).toString();
+                            const v = headers.objectForKey_(k).toString();
+                            m.setValue_forHTTPHeaderField_(v, k);
+                        }
+                    }
+                    // ensure Host header is original host (virtual hosting)
+                    try {
+                        const origHost = ObjC.Object(origReq.URL()).host();
+                        if (origHost) m.setValue_forHTTPHeaderField_(origHost.toString(), "Host");
+                    } catch (e) {}
+                } catch (e) {}
+                // copy body if present
+                try {
+                    const body = origReq.HTTPBody ? origReq.HTTPBody() : null;
+                    if (body) m.setHTTPBody_(body);
+                } catch (e) {}
+
+                return m;
+            } catch (e) {
+                return origReq;
+            }
+        }
+
+        // Hook -[NSURLSession dataTaskWithRequest:]
+        try {
+            const sel1 = "- dataTaskWithRequest:";
+            if (NSURLSession[sel1]) {
+                const origImpl = NSURLSession[sel1].implementation;
+                NSURLSession[sel1].implementation = ObjC.implement(NSURLSession[sel1], function (handle, selector, req) {
+                    try {
+                        const objReq = ObjC.Object(req);
+                        const newReq = buildProxyRequest(objReq);
+                        return origImpl(handle, selector, newReq);
+                    } catch (e) {
+                        try { return origImpl(handle, selector, req); } catch (ee) { return ptr(0); }
+                    }
+                });
+                console.log('Hooked NSURLSession ' + sel1);
+            }
+        } catch (e) {
+            console.warn('Failed hooking dataTaskWithRequest: ' + e);
+        }
+
+        // Hook -[NSURLSession dataTaskWithURL:]
+        try {
+            const sel2 = "- dataTaskWithURL:";
+            if (NSURLSession[sel2]) {
+                const origImpl2 = NSURLSession[sel2].implementation;
+                NSURLSession[sel2].implementation = ObjC.implement(NSURLSession[sel2], function (handle, selector, url) {
+                    try {
+                        const urlObj = ObjC.Object(url);
+                        const urlStr = urlObj.absoluteString().toString();
+                        const newNSURL = makeLocalURLWithOriginal(urlStr);
+                        if (newNSURL) {
+                            return origImpl2(handle, selector, newNSURL);
+                        } else {
+                            return origImpl2(handle, selector, url);
+                        }
+                    } catch (e) {
+                        try { return origImpl2(handle, selector, url); } catch (ee) { return ptr(0); }
+                    }
+                });
+                console.log('Hooked NSURLSession ' + sel2);
+            }
+        } catch (e) {
+            console.warn('Failed hooking dataTaskWithURL: ' + e);
+        }
+
+        // If the app uses NSURLConnection legacy APIs, hooking sendSynchronousRequest: or sendAsynchronousRequest: might be possible too.
+        return true;
+    } catch (e) {
+        console.warn('ObjC hooks failed: ' + e);
+        return false;
     }
+}
+
+setImmediate(function () {
+    console.log('proxy_ios.js starting — redirecting traffic to ' + TARGET_IP + ':' + TARGET_PORT);
+    const nativeOk = tryNativeConnectHooks();
+    const cfOk = tryCFStreamHook();
+    const objcOk = tryObjCHooks();
+
+    if (!nativeOk && !cfOk && !objcOk) {
+        console.log('No hooks installed (native / CF / ObjC). The app may be statically linked or using unusual networking code.');
+        console.log('Consider adding hooks for sendto, send, socket, connectat, CFSocketConnectToAddress, or manually enumerating exports containing "connect" to attach to.');
+    } else {
+        console.log('Hooks installed (native=' + nativeOk + ', cf=' + cfOk + ', objc=' + objcOk + ').');
+    }
+
+    console.log('Note: on a physical iOS device, 127.0.0.1 points to the device itself. If you want to reach your Mac from the device, use a reverse tunnel (ssh -R) or set up a reachable host IP. On the iOS Simulator, 127.0.0.1 is the host machine.');
 });
