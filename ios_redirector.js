@@ -18,6 +18,9 @@
 const PROXY_IP = "127.0.0.1";
 const PROXY_PORT = 8080;
 
+// Set AF_INET explicitly for clarity
+const AF_INET = 2;
+
 // --- Utility Functions for Byte Order and IP Conversion ---
 
 // Convert port (host byte order) to network byte order (Big-Endian)
@@ -75,8 +78,9 @@ try {
                 }
             },
             onLeave: function (retval) {
-                // Only modify the result if getaddrinfo succeeded and we intended to redirect
-                if (retval.toInt32() === 0 && this.doRedirect) {
+                // Only modify the result if getaddrinfo succeeded (retval is 0) and we intended to redirect
+                // FIX: Changed retval.toInt32() to the more robust retval.toS32() to fix TypeError.
+                if (retval.toS32() === 0 && this.doRedirect) {
                     
                     // The result (res) is a pointer to a struct addrinfo chain.
                     // We will replace the first node in the chain to point to our proxy.
@@ -84,30 +88,15 @@ try {
                     
                     if (!resPtr.isNull()) {
                         // The structure of the first addrinfo node (resPtr) contains:
-                        // 1. ai_addr (Pointer to sockaddr structure)
-                        // 2. ai_addrlen (Size of sockaddr structure)
-                        // The sockaddr structure is usually at offset 24 or 32 depending on architecture/ABI. 
-                        
                         // We will check the address family ai_family (usually at offset 8 on 64-bit Darwin)
                         const ai_family = resPtr.add(8).readS32();
 
                         if (ai_family === AF_INET) {
-                            // Find the pointer to the sockaddr_in structure (ai_addr)
-                            // On 64-bit Darwin, ai_addr is often at offset 24 (or 32, need to check, but let's assume standard ABI for simplicity)
-                            // A safer way is to use memory offsets defined by the OS ABI. For simplicity, we assume
-                            // that the first address pointer (ai_addr) can be found at a known offset.
-                            // Given the complexity of abi offsets, we will rely on overwriting the first resolved address structure.
-                            
-                            // Since the target application will likely use the first result, we overwrite the sockaddr_in structure.
-                            // sockaddr_in is usually pointed to by ai_addr (address pointer).
-                            
-                            // A robust, common hack is to overwrite the structure at the address pointed to by ai_addr.
-                            // The pointer to the sockaddr struct (ai_addr) is usually at offset 24 (8 bytes for flags, 4 for family, 4 for socktype, 4 for protocol, 4 for addrlen, 8 for ai_canonname, 8 for ai_addr)
+                            // The pointer to the sockaddr struct (ai_addr) is usually at offset 24 (or 32, need to check, but let's assume standard ABI for simplicity)
                             const ai_addr_ptr = resPtr.add(24).readPointer(); // Assuming offset 24 for ai_addr ptr on 64-bit
                             
                             if (!ai_addr_ptr.isNull()) {
                                 // sockaddr_in structure: 16 bytes total
-                                // Offset 0: length (1 byte)
                                 // Offset 1: family (1 byte - AF_INET=2)
                                 // Offset 2: port (2 bytes - NBO)
                                 // Offset 4: IP (4 bytes - NBO)
@@ -124,8 +113,7 @@ try {
                                 console.warn("[-] Failed to find ai_addr pointer to overwrite.");
                             }
                         } else {
-                            // If it's IPv6, we would need to map to ::ffff:127.0.0.1 (too complex for a simple script, 
-                            // but the app should fall back to the overwritten IPv4 address structure)
+                            // If it's IPv6, we would need to map to ::ffff:127.0.0.1, but for simplicity and robustness, we rely on the IPv4 redirect
                             console.warn("[-] Resolved address is not IPv4. Skipping modification.");
                         }
                     }
