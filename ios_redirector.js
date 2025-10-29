@@ -71,7 +71,8 @@ try {
                 // Store context for onLeave
                 this.resPtrPtr = args[3];
 
-                if (hostname && !hostname.startsWith(PROXY_IP)) {
+                // FIX: Ensured hostname is a valid string before calling startsWith().
+                if (hostname && typeof hostname === 'string' && !hostname.startsWith(PROXY_IP)) {
                     // We will redirect all lookups except for our proxy IP itself to avoid loops.
                     
                     console.log(`[***] Intercepting DNS lookup for ${hostname} on port ${servname}...`);
@@ -80,7 +81,9 @@ try {
             },
             onLeave: function (retval) {
                 // Only modify the result if getaddrinfo succeeded (retval is 0) and we intended to redirect
-                if (retval.toS32() === 0 && this.doRedirect) {
+                // FIX: Use Number(retval) to safely coerce the return value (which might be a Number or a NativePointer) 
+                // into a primitive number, resolving the TypeError: not a function.
+                if (Number(retval) === 0 && this.doRedirect) {
                     
                     // The result (res) is a pointer to a struct addrinfo chain.
                     // We will replace the first node in the chain to point to our proxy.
@@ -92,7 +95,6 @@ try {
 
                         if (ai_family === AF_INET) {
                             // On 64-bit Darwin/iOS, the pointer to sockaddr struct (ai_addr) is reliably at offset 32.
-                            // FIX: Changed offset from 24 to 32 for 64-bit ABI compatibility.
                             const ai_addr_ptr = resPtr.add(32).readPointer();
                             
                             if (!ai_addr_ptr.isNull()) {
